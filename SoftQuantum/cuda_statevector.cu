@@ -169,6 +169,23 @@ extern "C" __global__ void k_apply_kq(
 
 static void check(bool ok, const char* msg){ if(!ok) throw std::runtime_error(msg); }
 
+static std::vector<C128> reorder_two_qubit_matrix(py::array_t<std::complex<double>, py::array::c_style> U, int q1, int q2){
+    const auto* src = reinterpret_cast<const C128*>(U.data());
+    std::vector<C128> out(16);
+    if (q1 < q2){
+        for (int i = 0; i < 16; ++i) out[i] = src[i];
+        return out;
+    }
+
+    const int perm[4] = {0, 2, 1, 3}; // swap |01> and |10>
+    for (int row = 0; row < 4; ++row){
+        for (int col = 0; col < 4; ++col){
+            out[row * 4 + col] = src[perm[row] * 4 + perm[col]];
+        }
+    }
+    return out;
+}
+
 // Host wrappers --------------------------------------------------------------
 void apply_1q(py::array_t<std::complex<double>, py::array::c_style> state, int n, int q, py::array_t<std::complex<double>, py::array::c_style> U){
     if (state.ndim()!=1) throw std::runtime_error("state must be 1D");
@@ -176,18 +193,17 @@ void apply_1q(py::array_t<std::complex<double>, py::array::c_style> state, int n
     size_t dim = (size_t)1 << n;
     if ((size_t)state.shape(0)!=dim) throw std::runtime_error("state length mismatch");
 
-    C128 *d_state=nullptr; C128 *d_U=nullptr;
+    C128 *d_state=nullptr;
     cudaMalloc(&d_state, dim*sizeof(C128));
-    cudaMalloc(&d_U, 4*sizeof(C128));
     cudaMemcpy(d_state, state.data(), dim*sizeof(C128), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_U, U.data(), 4*sizeof(C128), cudaMemcpyHostToDevice);
+    const auto* hU = reinterpret_cast<const C128*>(U.data());
 
     dim3 block(256); dim3 grid((unsigned)((((size_t)1<<(n-1))+255)/256));
-    k_apply_1q<<<grid,block>>>(d_state, n, q, ((C128*)d_U)[0], ((C128*)d_U)[1], ((C128*)d_U)[2], ((C128*)d_U)[3]);
+    k_apply_1q<<<grid,block>>>(d_state, n, q, hU[0], hU[1], hU[2], hU[3]);
     cudaDeviceSynchronize();
 
     cudaMemcpy(state.mutable_data(), d_state, dim*sizeof(C128), cudaMemcpyDeviceToHost);
-    cudaFree(d_state); cudaFree(d_U);
+    cudaFree(d_state);
 }
 
 void apply_2q(py::array_t<std::complex<double>, py::array::c_style> state, int n, int q1, int q2, py::array_t<std::complex<double>, py::array::c_style> U){
@@ -196,10 +212,11 @@ void apply_2q(py::array_t<std::complex<double>, py::array::c_style> state, int n
     if ((size_t)state.shape(0)!=dim) throw std::runtime_error("state length mismatch");
 
     C128 *d_state=nullptr; C128 *d_U=nullptr;
+    auto U_host = reorder_two_qubit_matrix(U, q1, q2);
     cudaMalloc(&d_state, dim*sizeof(C128));
     cudaMalloc(&d_U, 16*sizeof(C128));
     cudaMemcpy(d_state, state.data(), dim*sizeof(C128), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_U, U.data(), 16*sizeof(C128), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_U, U_host.data(), 16*sizeof(C128), cudaMemcpyHostToDevice);
 
     dim3 block(256); dim3 grid((unsigned)((((size_t)1<<(n-2))+255)/256));
     k_apply_2q<<<grid,block>>>(d_state, n, q1, q2, d_U);
@@ -211,27 +228,27 @@ void apply_2q(py::array_t<std::complex<double>, py::array::c_style> state, int n
 
 void apply_c1q(py::array_t<std::complex<double>, py::array::c_style> state, int n, uint64_t cmask, int q, py::array_t<std::complex<double>, py::array::c_style> U){
     size_t dim = (size_t)1 << n;
-    C128 *d_state=nullptr; C128 *d_U=nullptr;
+    C128 *d_state=nullptr;
     cudaMalloc(&d_state, dim*sizeof(C128));
-    cudaMalloc(&d_U, 4*sizeof(C128));
     cudaMemcpy(d_state, state.data(), dim*sizeof(C128), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_U, U.data(), 4*sizeof(C128), cudaMemcpyHostToDevice);
+    const auto* hU = reinterpret_cast<const C128*>(U.data());
 
     dim3 block(256); dim3 grid((unsigned)((((size_t)1<<(n-1))+255)/256));
-    k_apply_cmask_1q<<<grid,block>>>(d_state, n, cmask, q, ((C128*)d_U)[0], ((C128*)d_U)[1], ((C128*)d_U)[2], ((C128*)d_U)[3]);
+    k_apply_cmask_1q<<<grid,block>>>(d_state, n, cmask, q, hU[0], hU[1], hU[2], hU[3]);
     cudaDeviceSynchronize();
 
     cudaMemcpy(state.mutable_data(), d_state, dim*sizeof(C128), cudaMemcpyDeviceToHost);
-    cudaFree(d_state); cudaFree(d_U);
+    cudaFree(d_state);
 }
 
 void apply_c2q(py::array_t<std::complex<double>, py::array::c_style> state, int n, uint64_t cmask, int q1, int q2, py::array_t<std::complex<double>, py::array::c_style> U){
     size_t dim = (size_t)1 << n;
     C128 *d_state=nullptr; C128 *d_U=nullptr;
+    auto U_host = reorder_two_qubit_matrix(U, q1, q2);
     cudaMalloc(&d_state, dim*sizeof(C128));
     cudaMalloc(&d_U, 16*sizeof(C128));
     cudaMemcpy(d_state, state.data(), dim*sizeof(C128), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_U, U.data(), 16*sizeof(C128), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_U, U_host.data(), 16*sizeof(C128), cudaMemcpyHostToDevice);
 
     dim3 block(256); dim3 grid((unsigned)((((size_t)1<<(n-2))+255)/256));
     k_apply_cmask_2q<<<grid,block>>>(d_state, n, cmask, q1, q2, d_U);
