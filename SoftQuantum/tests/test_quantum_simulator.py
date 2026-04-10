@@ -1,4 +1,7 @@
-﻿import math
+﻿import io
+import math
+from contextlib import redirect_stdout
+
 import numpy as np
 import pytest
 
@@ -483,5 +486,122 @@ def test_noise_phase_damping_extremes():
     assert any(np.allclose(probs, target, atol=1e-8) for target in (np.array([1.0, 0.0]), np.array([0.0, 1.0])))
 
 
+def run_program(sim, lines, base_path=None):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        execute_qasm(sim, lines=lines, base_path=base_path)
+    return buf.getvalue()
+
+
+def test_qreg_preserves_seed_on_reset():
+    program = ["qreg 1", "h 0", "measure 0 0"]
+    sim_a = QuantumSimulator(1, seed=42)
+    sim_b = QuantumSimulator(1, seed=42)
+    run_program(sim_a, program)
+    run_program(sim_b, program)
+    assert sim_a.creg == sim_b.creg
+
+
+def test_openqasm_gate_definition_and_register_measurement():
+    sim = QuantumSimulator(1, seed=123)
+    run_program(
+        sim,
+        [
+            "OPENQASM 3",
+            'include "stdgates.inc"',
+            "qubit[2] q",
+            "bit[2] c",
+            "gate flippair a, b { x a; x b; }",
+            "flippair q[0], q[1]",
+            "measure q -> c",
+        ],
+    )
+    assert sim.creg == [1, 1]
+
+
+def test_openqasm_for_loop_and_parameterized_gate():
+    sim = QuantumSimulator(1, seed=124)
+    run_program(
+        sim,
+        [
+            "OPENQASM 3",
+            "qubit[2] q",
+            "bit[2] c",
+            "gate rot(theta) a { rx(theta) a; }",
+            "for int i in [0:1] { rot(pi) q[i]; }",
+            "measure q -> c",
+        ],
+    )
+    assert sim.creg == [1, 1]
+
+
+def test_if_else_on_classical_register_value():
+    sim = QuantumSimulator(1, seed=125)
+    run_program(
+        sim,
+        [
+            "OPENQASM 3",
+            "qubit[1] q",
+            "bit[1] c",
+            "x q[0]",
+            "measure q[0] -> c[0]",
+            "if (c == 1) { x q[0]; } else { h q[0]; }",
+            "measure q[0] -> c[0]",
+        ],
+    )
+    assert sim.creg == [0]
+    assert_state_almost_equal(sim.state, basis_state(1, 0))
+
+
+def test_while_loop_uses_classical_feedback():
+    sim = QuantumSimulator(1, seed=126)
+    run_program(
+        sim,
+        [
+            "OPENQASM 3",
+            "qubit[1] q",
+            "bit[1] c",
+            "x q[0]",
+            "measure q[0] -> c[0]",
+            "while (c == 1) { x q[0]; measure q[0] -> c[0]; }",
+        ],
+    )
+    assert sim.creg == [0]
+
+
+def test_shots_prints_counts():
+    sim = QuantumSimulator(1, seed=127)
+    output = run_program(
+        sim,
+        [
+            "OPENQASM 3",
+            "qubit[1] q",
+            "bit[1] c",
+            "shots 4",
+            "x q[0]",
+            "measure q[0] -> c[0]",
+        ],
+    )
+    assert "shots = 4" in output
+    assert "1: 4" in output
+
+
+def test_local_include_support(tmp_path):
+    include_path = tmp_path / "custom.inc"
+    include_path.write_text("gate dox a { x a; }\n", encoding="utf-8")
+    sim = QuantumSimulator(1, seed=128)
+    run_program(
+        sim,
+        [
+            "OPENQASM 3",
+            'include "custom.inc"',
+            "qubit[1] q",
+            "bit[1] c",
+            "dox q[0]",
+            "measure q[0] -> c[0]",
+        ],
+        base_path=tmp_path,
+    )
+    assert sim.creg == [1]
 
 
