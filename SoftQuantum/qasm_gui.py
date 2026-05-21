@@ -16,6 +16,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 try:
     from quantum_simulator_global import (
+        DensityMatrixSimulator,
         QuantumSimulator,
         _CUDA_BACKEND_NAME,
         _CUDA_STATUS,
@@ -131,6 +132,7 @@ class QasmStudio(tk.Tk):
         self.current_file: Path | None = None
         self.num_qubits = tk.IntVar(value=DEFAULT_QUBITS)
         self.sim_seed = tk.IntVar(value=42)
+        self.sim_mode = tk.StringVar(value="statevector")
 
         self._build_ui()
         self._new_document(default_sample=True)
@@ -147,6 +149,16 @@ class QasmStudio(tk.Tk):
 
         ttk.Label(top, text="Seed").pack(side="left")
         ttk.Entry(top, width=10, textvariable=self.sim_seed).pack(side="left", padx=(4, 16))
+
+        ttk.Label(top, text="Mode").pack(side="left")
+        self.combo_mode = ttk.Combobox(
+            top,
+            textvariable=self.sim_mode,
+            values=("statevector", "density_matrix"),
+            state="readonly",
+            width=15,
+        )
+        self.combo_mode.pack(side="left", padx=(4, 16))
 
         backend_text = _CUDA_BACKEND_NAME if _HAVE_CUDA else "cpu"
         ttk.Label(top, text=f"Backend: {backend_text}").pack(side="left")
@@ -354,7 +366,9 @@ if (c == 0) {
             return
 
         try:
-            sim = QuantumSimulator(max(int(self.num_qubits.get()), 1), seed=int(self.sim_seed.get()))
+            mode = self.sim_mode.get()
+            sim_cls = DensityMatrixSimulator if mode == "density_matrix" else QuantumSimulator
+            sim = sim_cls(max(int(self.num_qubits.get()), 1), seed=int(self.sim_seed.get()))
         except Exception as exc:
             messagebox.showerror("Simulator Error", str(exc))
             return
@@ -364,15 +378,16 @@ if (c == 0) {
         t0 = time.time()
         try:
             with redirect_stdout(buf):
-                execute_qasm(sim, lines=code.splitlines(), base_path=base_path)
+                result = execute_qasm(sim, lines=code.splitlines(), base_path=base_path, mode=mode)
         except Exception as exc:
             self._append_output(f"\n[error] {exc}\n")
             self._set_status("Execution failed")
             return
 
         elapsed_ms = (time.time() - t0) * 1000.0
+        backend_name = result.get("backend", sim.backend_name)
         self._append_output(
-            f"\n===== Run complete ({elapsed_ms:.1f} ms, backend={sim.backend_name}) =====\n"
+            f"\n===== Run complete ({elapsed_ms:.1f} ms, backend={backend_name}, mode={mode}) =====\n"
         )
         self._append_output(buf.getvalue() + "\n")
         self._set_status("Execution complete")

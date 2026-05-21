@@ -23,12 +23,23 @@ else:
     try:
         probe = cp.asarray(np.arange(4, dtype=np.float64).reshape(2, 2))
         cp.asnumpy(cp.transpose(probe).reshape(4))
+        probe_state = cp.asarray(np.array([1.0 + 0.0j, 0.0 + 0.0j], dtype=np.complex128))
+        probe_gate = cp.asarray(np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128))
+        cp.asnumpy(probe_gate @ probe_state)
+        probe_ctrl = cp.asarray(np.arange(8, dtype=np.complex128).reshape(2, 2, 2))
+        moved = cp.transpose(probe_ctrl, (0, 2, 1))
+        block = moved[(1,)]
+        moved[(1,)] = block.reshape((2, -1)).reshape(block.shape)
+        cp.asnumpy(moved)
     except Exception as exc:
         cp = None
         _CUPY_IMPORT_ERROR = exc
         _CUDA_BACKEND_NAME = None
         _HAVE_CUDA = False
-        _CUDA_STATUS = f"Unavailable (CuPy runtime check failed: {exc.__class__.__name__}: {exc})"
+        _CUDA_STATUS = (
+            f"Unavailable (CuPy runtime check failed: {exc.__class__.__name__}: {exc}; "
+            "check TMP, TEMP, and CUPY_CACHE_DIR permissions)"
+        )
     else:
         _CUPY_IMPORT_ERROR = None
         _CUDA_BACKEND_NAME = "cupy"
@@ -46,6 +57,39 @@ def _validate_qubits(n_qubits: int, qs: Sequence[int]):
     for q in qs:
         if not (0 <= q < n_qubits):
             raise IndexError(f"Qubit index {q} out of range for {n_qubits} qubits")
+
+
+def _validate_unique_qubits(qs: Sequence[int], label: str):
+    if len(set(qs)) != len(tuple(qs)):
+        raise ValueError(f"{label} must not contain duplicate qubits")
+
+
+def _is_unitary(U: Array, atol: float = 1e-10) -> bool:
+    U = np.asarray(U, dtype=np.complex128)
+    if U.ndim != 2 or U.shape[0] != U.shape[1]:
+        return False
+    ident = np.eye(U.shape[0], dtype=np.complex128)
+    return bool(np.allclose(U.conj().T @ U, ident, atol=atol, rtol=0.0))
+
+
+def _validate_probability(p: float, name: str = "p") -> float:
+    value = float(p)
+    if not (0.0 <= value <= 1.0):
+        raise ValueError(f"{name} must be in [0, 1], got {p}")
+    return value
+
+
+def _validate_kraus_ops(kraus_ops: Sequence[Array], dim: int, atol: float = 1e-10):
+    if not kraus_ops:
+        raise ValueError("kraus_ops must contain at least one operator")
+    acc = np.zeros((dim, dim), dtype=np.complex128)
+    for idx, K in enumerate(kraus_ops):
+        K = np.asarray(K, dtype=np.complex128)
+        if K.shape != (dim, dim):
+            raise ValueError(f"Kraus operator {idx} must be {(dim, dim)}, got {K.shape}")
+        acc += K.conj().T @ K
+    if not np.allclose(acc, np.eye(dim, dtype=np.complex128), atol=atol, rtol=0.0):
+        raise ValueError("Kraus operators must satisfy sum(K^dagger K) = I")
 
 
 def _as_tuple(x: Iterable[int]) -> Tuple[int, ...]:
@@ -502,7 +546,7 @@ def _parse_program(
 ) -> List[Statement]:
     text = text.lstrip("\ufeff")
     tokens = _tokenize_program(text)
-    statements, pos = _parse_block(tokens, 0, base_path, include_stack or ())
+    statements, pos = _parse_block(tokens, 0, base_path, include_stack or (), expect_closing=False)
     if pos != len(tokens):
         raise SyntaxError("Unexpected trailing tokens")
     return statements
@@ -513,14 +557,19 @@ def _parse_block(
     pos: int,
     base_path: Optional[Path],
     include_stack: Tuple[Path, ...],
+    expect_closing: bool = False,
 ) -> Tuple[List[Statement], int]:
     statements: List[Statement] = []
     while pos < len(tokens):
         token = tokens[pos]
         if token == "}":
+            if not expect_closing:
+                raise SyntaxError("Unexpected closing brace")
             return statements, pos + 1
         parsed, pos = _parse_statement(tokens, pos, base_path, include_stack)
         statements.extend(parsed)
+    if expect_closing:
+        raise SyntaxError("Unclosed block; expected '}'")
     return statements, pos
 
 
@@ -556,7 +605,7 @@ def _parse_statement(
         pos += 1
         if pos >= len(tokens) or tokens[pos] != "{":
             raise SyntaxError(f"Gate '{name}' requires a braced body")
-        body, pos = _parse_block(tokens, pos + 1, base_path, include_stack)
+        body, pos = _parse_block(tokens, pos + 1, base_path, include_stack, expect_closing=True)
         return [Statement(kind="gate", name=name, params=params, qargs=qargs, body=body)], pos
 
     if lower.startswith("if"):
@@ -597,7 +646,7 @@ def _parse_if_statement(
     if inline_tail:
         body = _parse_inline_program(inline_tail, base_path, include_stack)
     elif pos < len(tokens) and tokens[pos] == "{":
-        body, pos = _parse_block(tokens, pos + 1, base_path, include_stack)
+        body, pos = _parse_block(tokens, pos + 1, base_path, include_stack, expect_closing=True)
     else:
         body, pos = _parse_statement(tokens, pos, base_path, include_stack)
 
@@ -609,7 +658,7 @@ def _parse_if_statement(
         if inline_else:
             else_body = _parse_inline_program(inline_else, base_path, include_stack)
         elif pos < len(tokens) and tokens[pos] == "{":
-            else_body, pos = _parse_block(tokens, pos + 1, base_path, include_stack)
+            else_body, pos = _parse_block(tokens, pos + 1, base_path, include_stack, expect_closing=True)
         else:
             else_body, pos = _parse_statement(tokens, pos, base_path, include_stack)
 
@@ -634,7 +683,7 @@ def _parse_for_statement(
     if inline_tail:
         body = _parse_inline_program(inline_tail, base_path, include_stack)
     elif pos < len(tokens) and tokens[pos] == "{":
-        body, pos = _parse_block(tokens, pos + 1, base_path, include_stack)
+        body, pos = _parse_block(tokens, pos + 1, base_path, include_stack, expect_closing=True)
     else:
         body, pos = _parse_statement(tokens, pos, base_path, include_stack)
     return Statement(kind="for", var_name=var_name, iterable=iterable, body=body), pos
@@ -652,7 +701,7 @@ def _parse_while_statement(
     if inline_tail:
         body = _parse_inline_program(inline_tail, base_path, include_stack)
     elif pos < len(tokens) and tokens[pos] == "{":
-        body, pos = _parse_block(tokens, pos + 1, base_path, include_stack)
+        body, pos = _parse_block(tokens, pos + 1, base_path, include_stack, expect_closing=True)
     else:
         body, pos = _parse_statement(tokens, pos, base_path, include_stack)
     return Statement(kind="while", condition=condition, body=body), pos
@@ -739,10 +788,33 @@ class QuantumSimulator:
     def _axis_of(self, q: int) -> int:
         return self.num_qubits - 1 - int(q)
 
+    def _validate_state_vector(self) -> Array:
+        arr = np.asarray(self.state)
+        if arr.shape != (self.dim,):
+            raise ValueError(f"state must have shape {(self.dim,)}, got {arr.shape}")
+        if not np.issubdtype(arr.dtype, np.complexfloating):
+            arr = arr.astype(self.dtype)
+        elif arr.dtype != self.dtype:
+            arr = arr.astype(self.dtype, copy=False)
+        self.state = arr
+        return self.state
+
+    def _validate_cbit(self, cbit: int) -> int:
+        try:
+            c = int(cbit)
+        except Exception as exc:
+            raise TypeError(f"Classical bit index {cbit!r} is not integer-compatible") from exc
+        if isinstance(cbit, (float, np.floating)) and not float(cbit).is_integer():
+            raise TypeError(f"Classical bit index {cbit!r} is not an integer")
+        if not (0 <= c < len(self.creg)):
+            raise IndexError(f"Classical bit index {c} out of range for {len(self.creg)} bits")
+        return c
+
     def _as_tensor(self) -> Array:
-        return self.state.reshape((2,) * self.num_qubits)
+        return self._validate_state_vector().reshape((2,) * self.num_qubits)
 
     def _normalize_(self):
+        self._validate_state_vector()
         norm2 = float(np.vdot(self.state, self.state).real)
         if abs(norm2 - 1.0) > 1e-15 and norm2 > _EPS:
             self.state /= math.sqrt(norm2)
@@ -759,7 +831,7 @@ class QuantumSimulator:
         psi = cp.asarray(self._as_tensor())
         U_gpu = cp.asarray(np.asarray(U, dtype=self.dtype))
         axes = tuple(self._axis_of(q) for q in targets)
-        axes_front = tuple(reversed(axes))
+        axes_front = axes
         rest_axes = tuple(ax for ax in range(self.num_qubits) if ax not in axes)
         perm = axes_front + rest_axes
         permuted = cp.transpose(psi, perm)
@@ -783,7 +855,7 @@ class QuantumSimulator:
         U_gpu = cp.asarray(np.asarray(U, dtype=self.dtype))
         ax_c = tuple(self._axis_of(q) for q in controls)
         ax_t = tuple(self._axis_of(q) for q in targets)
-        ax_t_front = tuple(reversed(ax_t))
+        ax_t_front = ax_t
         rest = tuple(ax for ax in range(self.num_qubits) if ax not in (*ax_c, *ax_t))
         perm = ax_c + ax_t_front + rest
         moved = cp.transpose(psi, perm)
@@ -795,28 +867,35 @@ class QuantumSimulator:
         out = cp.transpose(moved, tuple(np.argsort(perm)))
         self.state = cp.asnumpy(out.reshape(self.dim)).astype(self.dtype, copy=False)
 
-    def apply_unitary(self, targets: Sequence[int], U: Array):
+    def apply_unitary(self, targets: Sequence[int], U: Array, validate_unitary: bool = False):
         t = _as_tuple(targets)
         k = len(t)
         if k == 0:
             return
         _validate_qubits(self.num_qubits, t)
+        _validate_unique_qubits(t, "targets")
+        self._validate_state_vector()
         m = 1 << k
         U = np.asarray(U, dtype=self.dtype)
         if U.shape != (m, m):
             raise ValueError(f"U must be {(m, m)} for k={k}, got {U.shape}")
+        if validate_unitary and not _is_unitary(U):
+            raise ValueError("U must be unitary")
 
         if self._gpu_enabled():
             try:
                 self._apply_unitary_gpu(t, U)
             except Exception as exc:
-                raise RuntimeError(f"CuPy backend failed while applying a {k}-qubit unitary") from exc
+                raise RuntimeError(
+                    f"CuPy backend failed while applying a {k}-qubit unitary; "
+                    "check TMP, TEMP, and CUPY_CACHE_DIR permissions"
+                ) from exc
             self._normalize_()
             return
 
         psi = self._as_tensor()
         axes = tuple(self._axis_of(q) for q in t)
-        axes_front = tuple(reversed(axes))
+        axes_front = axes
         rest_axes = tuple(ax for ax in range(self.num_qubits) if ax not in axes)
         perm = axes_front + rest_axes
         permuted = np.transpose(psi, perm)
@@ -833,10 +912,13 @@ class QuantumSimulator:
         targets: Sequence[int],
         U: Array,
         ctrl_state: Optional[Sequence[int]] = None,
+        validate_unitary: bool = False,
     ):
         c = _as_tuple(controls)
         t = _as_tuple(targets)
         _validate_qubits(self.num_qubits, (*c, *t))
+        _validate_unique_qubits(c, "controls")
+        _validate_unique_qubits(t, "targets")
         if set(c) & set(t):
             raise ValueError("controls and targets must be disjoint")
         if ctrl_state is None:
@@ -844,27 +926,35 @@ class QuantumSimulator:
         ctrl_state = _as_tuple(ctrl_state)
         if len(ctrl_state) != len(c):
             raise ValueError("ctrl_state length must match number of controls")
+        if any(b not in (0, 1) for b in ctrl_state):
+            raise ValueError("ctrl_state entries must be 0 or 1")
 
         k = len(t)
         if k == 0:
             return
+        self._validate_state_vector()
         m = 1 << k
         U = np.asarray(U, dtype=self.dtype)
         if U.shape != (m, m):
             raise ValueError(f"U must be {(m, m)} for k={k}, got {U.shape}")
+        if validate_unitary and not _is_unitary(U):
+            raise ValueError("U must be unitary")
 
         if self._gpu_enabled():
             try:
                 self._apply_controlled_unitary_gpu(c, t, U, ctrl_state)
             except Exception as exc:
-                raise RuntimeError("CuPy backend failed while applying a controlled unitary") from exc
+                raise RuntimeError(
+                    "CuPy backend failed while applying a controlled unitary; "
+                    "check TMP, TEMP, and CUPY_CACHE_DIR permissions"
+                ) from exc
             self._normalize_()
             return
 
         psi = self._as_tensor()
         ax_c = tuple(self._axis_of(q) for q in c)
         ax_t = tuple(self._axis_of(q) for q in t)
-        ax_t_front = tuple(reversed(ax_t))
+        ax_t_front = ax_t
         rest = tuple(ax for ax in range(self.num_qubits) if ax not in (*ax_c, *ax_t))
         perm = ax_c + ax_t_front + rest
         moved = np.transpose(psi, perm)
@@ -878,17 +968,23 @@ class QuantumSimulator:
         self.state = out.reshape(self.dim).astype(self.dtype, copy=False)
         self._normalize_()
 
-    def apply_global_unitary_full(self, U_full: Array):
+    def apply_global_unitary_full(self, U_full: Array, validate_unitary: bool = False):
+        self._validate_state_vector()
         U_full = np.asarray(U_full, dtype=self.dtype)
         if U_full.shape != (self.dim, self.dim):
             raise ValueError(f"U_full must be {(self.dim, self.dim)}")
+        if validate_unitary and not _is_unitary(U_full):
+            raise ValueError("U_full must be unitary")
         if self._gpu_enabled():
             try:
                 psi = cp.asarray(self.state)
                 out = cp.asarray(U_full) @ psi
                 self.state = cp.asnumpy(out).astype(self.dtype, copy=False)
             except Exception as exc:
-                raise RuntimeError("CuPy backend failed while applying a full unitary") from exc
+                raise RuntimeError(
+                    "CuPy backend failed while applying a full unitary; "
+                    "check TMP, TEMP, and CUPY_CACHE_DIR permissions"
+                ) from exc
             self._normalize_()
             return
         self.state = (U_full @ self.state).astype(self.dtype, copy=False)
@@ -900,13 +996,15 @@ class QuantumSimulator:
         if k == 0:
             return self.state.copy()
         _validate_qubits(self.num_qubits, t)
+        _validate_unique_qubits(t, "targets")
+        self._validate_state_vector()
         m = 1 << k
         M = np.asarray(M, dtype=self.dtype)
         if M.shape != (m, m):
             raise ValueError(f"Operator must be {(m, m)} for k={k}")
         psi = self._as_tensor()
         axes = tuple(self._axis_of(q) for q in t)
-        axes_front = tuple(reversed(axes))
+        axes_front = axes
         rest_axes = tuple(ax for ax in range(self.num_qubits) if ax not in axes)
         perm = axes_front + rest_axes
         moved = np.transpose(psi, perm)
@@ -916,12 +1014,22 @@ class QuantumSimulator:
         psi2 = np.transpose(reshaped, np.argsort(perm))
         return psi2.reshape(self.dim).astype(self.dtype, copy=False)
 
-    def apply_channel(self, targets: Sequence[int], kraus_ops: Sequence[Array]):
+    def apply_channel(self, targets: Sequence[int], kraus_ops: Sequence[Array], validate_kraus: bool = False):
+        """Apply one stochastic quantum-trajectory Kraus branch to the statevector."""
+        t = _as_tuple(targets)
+        _validate_qubits(self.num_qubits, t)
+        _validate_unique_qubits(t, "targets")
+        self._validate_state_vector()
+        if len(kraus_ops) == 0:
+            raise ValueError("kraus_ops must contain at least one operator")
         ops = [np.asarray(K, dtype=self.dtype) for K in kraus_ops]
+        dim = 1 << len(t)
+        if validate_kraus:
+            _validate_kraus_ops(ops, dim)
         candidates: List[Array] = []
         probs: List[float] = []
         for K in ops:
-            v = self._apply_operator(targets, K)
+            v = self._apply_operator(t, K)
             p = float(np.vdot(v, v).real)
             candidates.append(v)
             probs.append(max(p, 0.0))
@@ -934,20 +1042,23 @@ class QuantumSimulator:
         self.state = v / math.sqrt(max(np.vdot(v, v).real, _EPS))
 
     def noise_bit_flip(self, q: int, p: float):
-        p = min(max(float(p), 0.0), 1.0)
-        K0 = math.sqrt(max(0.0, 1.0 - p)) * np.eye(2, dtype=self.dtype)
-        K1 = math.sqrt(max(0.0, p)) * np.array([[0, 1], [1, 0]], dtype=self.dtype)
-        self.apply_channel([q], [K0, K1])
+        _validate_qubits(self.num_qubits, [q])
+        p = _validate_probability(p)
+        K0 = math.sqrt(1.0 - p) * np.eye(2, dtype=self.dtype)
+        K1 = math.sqrt(p) * np.array([[0, 1], [1, 0]], dtype=self.dtype)
+        self.apply_channel([q], [K0, K1], validate_kraus=True)
 
     def noise_phase_flip(self, q: int, p: float):
-        p = min(max(float(p), 0.0), 1.0)
-        K0 = math.sqrt(max(0.0, 1.0 - p)) * np.eye(2, dtype=self.dtype)
-        K1 = math.sqrt(max(0.0, p)) * np.array([[1, 0], [0, -1]], dtype=self.dtype)
-        self.apply_channel([q], [K0, K1])
+        _validate_qubits(self.num_qubits, [q])
+        p = _validate_probability(p)
+        K0 = math.sqrt(1.0 - p) * np.eye(2, dtype=self.dtype)
+        K1 = math.sqrt(p) * np.array([[1, 0], [0, -1]], dtype=self.dtype)
+        self.apply_channel([q], [K0, K1], validate_kraus=True)
 
     def noise_depolarizing(self, q: int, p: float):
-        p = min(max(float(p), 0.0), 1.0)
-        ops = [math.sqrt(max(0.0, 1.0 - p)) * np.eye(2, dtype=self.dtype)]
+        _validate_qubits(self.num_qubits, [q])
+        p = _validate_probability(p)
+        ops = [math.sqrt(1.0 - p) * np.eye(2, dtype=self.dtype)]
         if p > 0.0:
             coef = math.sqrt(p / 3.0)
             ops.extend(
@@ -957,19 +1068,21 @@ class QuantumSimulator:
                     coef * np.array([[1, 0], [0, -1]], dtype=self.dtype),
                 ]
             )
-        self.apply_channel([q], ops)
+        self.apply_channel([q], ops, validate_kraus=True)
 
     def noise_amplitude_damping(self, q: int, p: float):
-        p = min(max(float(p), 0.0), 1.0)
-        K0 = np.array([[1.0, 0.0], [0.0, math.sqrt(max(0.0, 1.0 - p))]], dtype=self.dtype)
-        K1 = np.array([[0.0, math.sqrt(max(0.0, p))], [0.0, 0.0]], dtype=self.dtype)
-        self.apply_channel([q], [K0, K1])
+        _validate_qubits(self.num_qubits, [q])
+        p = _validate_probability(p)
+        K0 = np.array([[1.0, 0.0], [0.0, math.sqrt(1.0 - p)]], dtype=self.dtype)
+        K1 = np.array([[0.0, math.sqrt(p)], [0.0, 0.0]], dtype=self.dtype)
+        self.apply_channel([q], [K0, K1], validate_kraus=True)
 
     def noise_phase_damping(self, q: int, p: float):
-        p = min(max(float(p), 0.0), 1.0)
-        K0 = np.array([[1.0, 0.0], [0.0, math.sqrt(max(0.0, 1.0 - p))]], dtype=self.dtype)
-        K1 = np.array([[0.0, 0.0], [0.0, math.sqrt(max(0.0, p))]], dtype=self.dtype)
-        self.apply_channel([q], [K0, K1])
+        _validate_qubits(self.num_qubits, [q])
+        p = _validate_probability(p)
+        K0 = np.array([[1.0, 0.0], [0.0, math.sqrt(1.0 - p)]], dtype=self.dtype)
+        K1 = np.array([[0.0, 0.0], [0.0, math.sqrt(p)]], dtype=self.dtype)
+        self.apply_channel([q], [K0, K1], validate_kraus=True)
 
     @staticmethod
     def Ux(theta: float) -> Array:
@@ -1175,6 +1288,9 @@ class QuantumSimulator:
         self.apply_controlled_unitary([c], [q1, q2], U)
 
     def measure(self, q: int, cbit: Optional[int] = None) -> int:
+        q = int(q)
+        _validate_qubits(self.num_qubits, [q])
+        cbit_index = None if cbit is None else self._validate_cbit(cbit)
         ax = self._axis_of(q)
         psi = self._as_tensor()
         moved = np.moveaxis(psi, ax, -1)
@@ -1190,8 +1306,8 @@ class QuantumSimulator:
         psi_back = np.moveaxis(moved, -1, ax)
         self.state = psi_back.reshape(self.dim)
         self._normalize_()
-        if cbit is not None and 0 <= cbit < len(self.creg):
-            self.creg[cbit] = outcome
+        if cbit_index is not None:
+            self.creg[cbit_index] = outcome
         return outcome
 
     def measure_all(self) -> List[int]:
@@ -1201,15 +1317,14 @@ class QuantumSimulator:
         return list(reversed(outcomes))
 
     def reset(self, q: int):
-        ax = self._axis_of(q)
-        psi = self._as_tensor()
-        moved = np.moveaxis(psi, ax, -1)
-        moved[..., 1] = 0.0
-        psi_back = np.moveaxis(moved, -1, ax)
-        self.state = psi_back.reshape(self.dim)
-        self._normalize_()
+        q = int(q)
+        _validate_qubits(self.num_qubits, [q])
+        outcome = self.measure(q)
+        if outcome == 1:
+            self.X(q)
 
     def probs(self) -> Array:
+        self._validate_state_vector()
         p = np.abs(self.state) ** 2
         s = float(p.sum())
         return p / (s if s > _EPS else 1.0)
@@ -1221,6 +1336,275 @@ class QuantumSimulator:
             if pr > tol:
                 out.append(f"({amp.real:+.6f}{amp.imag:+.6f}j)|{i:0{self.num_qubits}b}>")
         return " + ".join(out) if out else "0"
+
+
+class DensityMatrixSimulator(QuantumSimulator):
+    """Density-matrix simulator with deterministic CPTP channel evolution."""
+
+    def __init__(self, num_qubits: int, seed: Optional[int] = None, prefer_gpu: bool = False):
+        if num_qubits < 1:
+            raise ValueError("num_qubits must be >= 1")
+        self._prefer_gpu_requested = bool(prefer_gpu)
+        self.prefer_gpu = False
+        self._seed = None if seed is None else int(seed)
+        self.num_qubits = int(num_qubits)
+        self.dim = 1 << self.num_qubits
+        self.dtype = np.complex128
+        self.rng = np.random.default_rng(self._seed)
+        self.rho: Array = np.zeros((self.dim, self.dim), dtype=self.dtype)
+        self.rho[0, 0] = 1.0 + 0.0j
+        self.creg: List[int] = [0] * self.num_qubits
+
+    @property
+    def backend_name(self) -> str:
+        return "density_matrix"
+
+    @property
+    def backend_status(self) -> str:
+        if self._prefer_gpu_requested:
+            return "Density matrix CPU backend (GPU density path is not implemented yet)"
+        return "Density matrix CPU backend"
+
+    def reset_simulation(self, num_qubits: int, preserve_seed: bool = True):
+        seed = self._seed if preserve_seed else None
+        self.__init__(num_qubits, seed=seed, prefer_gpu=False)
+
+    def copy_from(self, other: "QuantumSimulator"):
+        if not isinstance(other, DensityMatrixSimulator):
+            raise TypeError("DensityMatrixSimulator can only copy from another density-matrix simulator")
+        self._prefer_gpu_requested = getattr(other, "_prefer_gpu_requested", False)
+        self.prefer_gpu = False
+        self._seed = other._seed
+        self.num_qubits = other.num_qubits
+        self.dim = other.dim
+        self.dtype = other.dtype
+        self.rng = other.rng
+        self.rho = other.rho.copy()
+        self.creg = list(other.creg)
+
+    def _validate_density_matrix(self) -> Array:
+        rho = np.asarray(self.rho)
+        if rho.shape != (self.dim, self.dim):
+            raise ValueError(f"rho must have shape {(self.dim, self.dim)}, got {rho.shape}")
+        if not np.issubdtype(rho.dtype, np.complexfloating):
+            rho = rho.astype(self.dtype)
+        elif rho.dtype != self.dtype:
+            rho = rho.astype(self.dtype, copy=False)
+        self.rho = rho
+        return self.rho
+
+    def _cleanup_density_(self, check_trace: bool = True):
+        self._validate_density_matrix()
+        self.rho = 0.5 * (self.rho + self.rho.conj().T)
+        tr = complex(np.trace(self.rho))
+        if check_trace:
+            if abs(tr) < _EPS:
+                raise ValueError("Density matrix trace is zero")
+            if not np.isclose(tr, 1.0, atol=1e-10, rtol=0.0):
+                raise ValueError(f"Density matrix trace is not preserved: {tr}")
+        if abs(tr) > _EPS:
+            self.rho /= tr
+        self.rho.real[np.abs(self.rho.real) < _EPS] = 0.0
+        self.rho.imag[np.abs(self.rho.imag) < _EPS] = 0.0
+
+    def density_matrix(self) -> Array:
+        return self._validate_density_matrix().copy()
+
+    def purity(self) -> float:
+        rho = self._validate_density_matrix()
+        return float(np.trace(rho @ rho).real)
+
+    def is_pure(self, atol: float = 1e-9) -> bool:
+        return abs(self.purity() - 1.0) <= atol
+
+    def is_positive_semidefinite(self, atol: float = 1e-9) -> bool:
+        evals = np.linalg.eigvalsh(self._validate_density_matrix())
+        return bool(np.min(evals) >= -atol)
+
+    def _expanded_operator(self, targets: Sequence[int], U: Array) -> Array:
+        t = _as_tuple(targets)
+        k = len(t)
+        _validate_qubits(self.num_qubits, t)
+        _validate_unique_qubits(t, "targets")
+        m = 1 << k
+        U = np.asarray(U, dtype=self.dtype)
+        if U.shape != (m, m):
+            raise ValueError(f"Operator must be {(m, m)} for k={k}, got {U.shape}")
+        full = np.zeros((self.dim, self.dim), dtype=self.dtype)
+        for col in range(self.dim):
+            local_col = 0
+            for q in t:
+                local_col = (local_col << 1) | ((col >> q) & 1)
+            for local_row in range(m):
+                row = col
+                for idx, q in enumerate(t):
+                    bit = (local_row >> (k - 1 - idx)) & 1
+                    if bit:
+                        row |= 1 << q
+                    else:
+                        row &= ~(1 << q)
+                full[row, col] = U[local_row, local_col]
+        return full
+
+    def _expanded_controlled_operator(
+        self,
+        controls: Sequence[int],
+        targets: Sequence[int],
+        U: Array,
+        ctrl_state: Sequence[int],
+    ) -> Array:
+        c = _as_tuple(controls)
+        t = _as_tuple(targets)
+        _validate_qubits(self.num_qubits, (*c, *t))
+        _validate_unique_qubits(c, "controls")
+        _validate_unique_qubits(t, "targets")
+        if set(c) & set(t):
+            raise ValueError("controls and targets must be disjoint")
+        ctrl_state = _as_tuple(ctrl_state)
+        if len(ctrl_state) != len(c):
+            raise ValueError("ctrl_state length must match number of controls")
+        if any(b not in (0, 1) for b in ctrl_state):
+            raise ValueError("ctrl_state entries must be 0 or 1")
+        k = len(t)
+        m = 1 << k
+        U = np.asarray(U, dtype=self.dtype)
+        if U.shape != (m, m):
+            raise ValueError(f"U must be {(m, m)} for k={k}, got {U.shape}")
+        full = np.zeros((self.dim, self.dim), dtype=self.dtype)
+        for col in range(self.dim):
+            if all(((col >> q) & 1) == ctrl_state[idx] for idx, q in enumerate(c)):
+                local_col = 0
+                for q in t:
+                    local_col = (local_col << 1) | ((col >> q) & 1)
+                for local_row in range(m):
+                    row = col
+                    for idx, q in enumerate(t):
+                        bit = (local_row >> (k - 1 - idx)) & 1
+                        if bit:
+                            row |= 1 << q
+                        else:
+                            row &= ~(1 << q)
+                    full[row, col] = U[local_row, local_col]
+            else:
+                full[col, col] = 1.0
+        return full
+
+    def apply_unitary(self, targets: Sequence[int], U: Array, validate_unitary: bool = False):
+        self._validate_density_matrix()
+        full = self._expanded_operator(targets, U)
+        if validate_unitary and not _is_unitary(np.asarray(U, dtype=self.dtype)):
+            raise ValueError("U must be unitary")
+        self.rho = full @ self.rho @ full.conj().T
+        self._cleanup_density_()
+
+    def apply_controlled_unitary(
+        self,
+        controls: Sequence[int],
+        targets: Sequence[int],
+        U: Array,
+        ctrl_state: Optional[Sequence[int]] = None,
+        validate_unitary: bool = False,
+    ):
+        if ctrl_state is None:
+            ctrl_state = (1,) * len(tuple(controls))
+        U = np.asarray(U, dtype=self.dtype)
+        if validate_unitary and not _is_unitary(U):
+            raise ValueError("U must be unitary")
+        full = self._expanded_controlled_operator(controls, targets, U, ctrl_state)
+        self._validate_density_matrix()
+        self.rho = full @ self.rho @ full.conj().T
+        self._cleanup_density_()
+
+    def apply_global_unitary_full(self, U_full: Array, validate_unitary: bool = False):
+        self._validate_density_matrix()
+        U_full = np.asarray(U_full, dtype=self.dtype)
+        if U_full.shape != (self.dim, self.dim):
+            raise ValueError(f"U_full must be {(self.dim, self.dim)}")
+        if validate_unitary and not _is_unitary(U_full):
+            raise ValueError("U_full must be unitary")
+        self.rho = U_full @ self.rho @ U_full.conj().T
+        self._cleanup_density_()
+
+    def _apply_operator(self, targets: Sequence[int], M: Array) -> Array:
+        full = self._expanded_operator(targets, M)
+        self._validate_density_matrix()
+        return full @ self.rho @ full.conj().T
+
+    def apply_channel(self, targets: Sequence[int], kraus_ops: Sequence[Array], validate_kraus: bool = True):
+        """Apply a deterministic density-matrix channel: rho -> sum_i K_i rho K_i^dagger."""
+        t = _as_tuple(targets)
+        _validate_qubits(self.num_qubits, t)
+        _validate_unique_qubits(t, "targets")
+        if len(kraus_ops) == 0:
+            raise ValueError("kraus_ops must contain at least one operator")
+        ops = [np.asarray(K, dtype=self.dtype) for K in kraus_ops]
+        dim = 1 << len(t)
+        if validate_kraus:
+            _validate_kraus_ops(ops, dim)
+        self._validate_density_matrix()
+        out = np.zeros_like(self.rho)
+        for K in ops:
+            full = self._expanded_operator(t, K)
+            out += full @ self.rho @ full.conj().T
+        self.rho = out
+        self._cleanup_density_(check_trace=validate_kraus)
+
+    def measure(self, q: int, cbit: Optional[int] = None) -> int:
+        q = int(q)
+        _validate_qubits(self.num_qubits, [q])
+        cbit_index = None if cbit is None else self._validate_cbit(cbit)
+        self._validate_density_matrix()
+        diag = np.real(np.diag(self.rho))
+        mask1 = np.array([bool((idx >> q) & 1) for idx in range(self.dim)])
+        p1 = float(np.sum(diag[mask1]))
+        p1 = min(max(p1, 0.0), 1.0)
+        p0 = 1.0 - p1
+        outcome = int(self.rng.random() < p1)
+        keep = mask1 if outcome == 1 else ~mask1
+        p = p1 if outcome == 1 else p0
+        if p < _EPS:
+            raise RuntimeError("Sampled a zero-probability measurement outcome")
+        self.rho[~keep, :] = 0.0
+        self.rho[:, ~keep] = 0.0
+        self.rho /= p
+        self._cleanup_density_()
+        if cbit_index is not None:
+            self.creg[cbit_index] = outcome
+        return outcome
+
+    def reset(self, q: int):
+        q = int(q)
+        _validate_qubits(self.num_qubits, [q])
+        K0 = np.array([[1.0, 0.0], [0.0, 0.0]], dtype=self.dtype)
+        K1 = np.array([[0.0, 1.0], [0.0, 0.0]], dtype=self.dtype)
+        self.apply_channel([q], [K0, K1], validate_kraus=True)
+
+    def probs(self) -> Array:
+        self._validate_density_matrix()
+        p = np.real(np.diag(self.rho)).copy()
+        p[p < 0.0] = 0.0
+        s = float(p.sum())
+        return p / (s if s > _EPS else 1.0)
+
+    def probabilities(self) -> Array:
+        return self.probs()
+
+    def state_ket(self, tol: float = 1e-9) -> str:
+        self._validate_density_matrix()
+        if self.is_pure(atol=max(tol, 1e-9)):
+            evals, evecs = np.linalg.eigh(self.rho)
+            vec = evecs[:, int(np.argmax(evals))]
+            pivot = next((idx for idx, amp in enumerate(vec) if abs(amp) > tol), None)
+            if pivot is not None:
+                vec = vec * np.exp(-1j * np.angle(vec[pivot]))
+            out = []
+            for i, amp in enumerate(vec):
+                if abs(amp) ** 2 > tol:
+                    out.append(f"({amp.real:+.6f}{amp.imag:+.6f}j)|{i:0{self.num_qubits}b}>")
+            return " + ".join(out) if out else "0"
+        probs = self.probs()
+        parts = [f"|{i:0{self.num_qubits}b}>:{pr:.6f}" for i, pr in enumerate(probs) if pr > tol]
+        return f"mixed density matrix (purity={self.purity():.6f}) " + ", ".join(parts)
 
 
 def _context_symbols(ctx: ProgramContext) -> Dict[str, object]:
@@ -1357,6 +1741,10 @@ def _classical_bitstring(ctx: ProgramContext) -> str:
 
 
 def _sample_bitstring_from_state(ctx: ProgramContext) -> str:
+    if isinstance(ctx.sim, DensityMatrixSimulator):
+        probs = ctx.sim.probs()
+        idx = int(ctx.sim.rng.choice(len(probs), p=probs))
+        return f"{idx:0{ctx.sim.num_qubits}b}"
     clone = QuantumSimulator(ctx.sim.num_qubits, seed=None, prefer_gpu=False)
     clone.state = ctx.sim.state.copy()
     clone.rng = np.random.default_rng(int(ctx.sim.rng.integers(0, 2**63 - 1)))
@@ -1624,6 +2012,12 @@ def _execute_command(text: str, ctx: ProgramContext):
     if _execute_legacy_u(text, ctx):
         return
 
+    if re.fullmatch(r"barrier(?:\s+.+)?", text, flags=re.IGNORECASE):
+        return
+
+    if re.fullmatch(r"delay(?:\[[^\]]*\])?(?:\s+.+)?", text, flags=re.IGNORECASE):
+        return
+
     if lowered.startswith("openqasm"):
         parts = text.split(maxsplit=1)
         if len(parts) != 2:
@@ -1727,9 +2121,6 @@ def _execute_command(text: str, ctx: ProgramContext):
     if lowered == "print_creg":
         for i, bit in enumerate(ctx.sim.creg):
             print(f"c[{i}] = {bit}")
-        return
-
-    if lowered in ("barrier", "delay"):
         return
 
     parts = _split_operands(text)
@@ -1850,7 +2241,33 @@ def _extract_shots(statements: Sequence[Statement]) -> Tuple[int, List[Statement
     return shots, remaining
 
 
-def execute_qasm(sim: QuantumSimulator, lines: Optional[List[str]] = None, base_path: Optional[Path] = None):
+def _qasm_result_payload(sim: QuantumSimulator, shots: int, counts: Optional[Dict[str, int]]):
+    payload = {
+        "shots": shots,
+        "counts": counts,
+        "creg": list(sim.creg),
+        "backend": sim.backend_name,
+        "probabilities": sim.probs(),
+        "sim": sim,
+    }
+    if isinstance(sim, DensityMatrixSimulator):
+        payload["state"] = None
+        payload["rho"] = sim.rho.copy()
+        payload["mode"] = "density_matrix"
+    else:
+        payload["state"] = sim.state.copy()
+        payload["rho"] = None
+        payload["mode"] = "statevector"
+    return payload
+
+
+def execute_qasm(
+    sim: QuantumSimulator,
+    lines: Optional[List[str]] = None,
+    base_path: Optional[Path] = None,
+    mode: Optional[str] = None,
+    density_matrix: bool = False,
+):
     """Execute the local OpenQASM-like program on ``sim``."""
     if lines is None:
         print("Enter QASM commands; type 'run' to execute:")
@@ -1864,27 +2281,45 @@ def execute_qasm(sim: QuantumSimulator, lines: Optional[List[str]] = None, base_
                 break
             lines.append(line)
 
+    mode_name = (mode or ("density_matrix" if density_matrix else "")).lower()
+    if mode_name in ("density", "dm"):
+        mode_name = "density_matrix"
+    if mode_name not in ("", "statevector", "density_matrix"):
+        raise ValueError("mode must be 'statevector' or 'density_matrix'")
+    use_density = density_matrix or mode_name == "density_matrix" or isinstance(sim, DensityMatrixSimulator)
+    run_sim: QuantumSimulator
+    if use_density and not isinstance(sim, DensityMatrixSimulator):
+        run_sim = DensityMatrixSimulator(sim.num_qubits, seed=sim.seed)
+    elif not use_density and isinstance(sim, DensityMatrixSimulator) and mode_name == "statevector":
+        raise ValueError("A DensityMatrixSimulator cannot execute in statevector mode")
+    else:
+        run_sim = sim
+
     program_text = ";\n".join(lines)
     base = Path(base_path) if base_path is not None else None
     statements = _parse_program(program_text, base)
     shots, statements = _extract_shots(statements)
 
     if shots == 1:
-        ctx = ProgramContext(sim=sim, base_path=base, qregs={"q": list(range(sim.num_qubits))}, cregs={"c": list(range(len(sim.creg)))})
+        ctx = ProgramContext(sim=run_sim, base_path=base, qregs={"q": list(range(run_sim.num_qubits))}, cregs={"c": list(range(len(run_sim.creg)))})
         _execute_statements(statements, ctx)
-        print(sim.state_ket())
-        for i, bit in enumerate(sim.creg):
+        print(run_sim.state_ket())
+        for i, bit in enumerate(run_sim.creg):
             print(f"c[{i}] = {bit}")
-        return {"shots": 1, "counts": None, "state": sim.state.copy(), "creg": list(sim.creg), "backend": sim.backend_name}
+        return _qasm_result_payload(run_sim, 1, None)
 
     counts: Counter[str] = Counter()
-    seed_rng = np.random.default_rng(sim.seed) if sim.seed is not None else None
+    seed_rng = np.random.default_rng(run_sim.seed) if run_sim.seed is not None else None
     last_ctx: Optional[ProgramContext] = None
-    initial_qubits = max(sim.num_qubits, 1)
+    initial_qubits = max(run_sim.num_qubits, 1)
+    sim_cls = DensityMatrixSimulator if isinstance(run_sim, DensityMatrixSimulator) else QuantumSimulator
 
     for _ in range(shots):
         shot_seed = None if seed_rng is None else int(seed_rng.integers(0, 2**63 - 1))
-        shot_sim = QuantumSimulator(initial_qubits, seed=shot_seed, prefer_gpu=sim.prefer_gpu)
+        if sim_cls is DensityMatrixSimulator:
+            shot_sim = DensityMatrixSimulator(initial_qubits, seed=shot_seed)
+        else:
+            shot_sim = QuantumSimulator(initial_qubits, seed=shot_seed, prefer_gpu=run_sim.prefer_gpu)
         ctx = ProgramContext(sim=shot_sim, base_path=base, qregs={"q": list(range(shot_sim.num_qubits))}, cregs={"c": list(range(len(shot_sim.creg)))})
         _execute_statements(statements, ctx)
         bitstring = _classical_bitstring(ctx) if ctx.saw_measurement else _sample_bitstring_from_state(ctx)
@@ -1892,9 +2327,9 @@ def execute_qasm(sim: QuantumSimulator, lines: Optional[List[str]] = None, base_
         last_ctx = ctx
 
     if last_ctx is not None:
-        sim.copy_from(last_ctx.sim)
+        run_sim.copy_from(last_ctx.sim)
 
     print(f"shots = {shots}")
     for bitstring in sorted(counts):
         print(f"{bitstring}: {counts[bitstring]}")
-    return {"shots": shots, "counts": dict(counts), "state": sim.state.copy(), "creg": list(sim.creg), "backend": sim.backend_name}
+    return _qasm_result_payload(run_sim, shots, dict(counts))
