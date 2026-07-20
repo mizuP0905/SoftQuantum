@@ -83,6 +83,7 @@ No separate `python setup.py build_ext --inplace` step is required for the curre
 - The legacy `cuda_statevector.cu` source is still kept in the repository for reference and experimentation, but it is not required for normal installation or runtime use.
 - GPU availability can still depend on local environment details such as driver state, CUDA compatibility, and whether CuPy can access its runtime cache / temporary compilation paths.
 - On Windows, CuPy/NVRTC may need writable temporary and cache directories. If backend initialization or execution reports a permission problem, set `TMP`, `TEMP`, and optionally `CUPY_CACHE_DIR` to writable directories before launching Python.
+- `DensityMatrixSimulator(prefer_gpu=True)` uses a CUDA RawKernel path for target-local unitary, controlled-unitary, and Kraus-channel updates when CuPy/CUDA is available. The arbitrary full-matrix `apply_global_unitary_full` path uses CUDA-backed CuPy matrix multiplication.
 
 ## Simulation Conventions
 
@@ -95,7 +96,6 @@ No separate `python setup.py build_ext --inplace` step is required for the curre
 - Density-matrix `reset(q)` is a deterministic CPTP reset channel using Kraus operators `|0><0|` and `|0><1|`.
 - `QuantumSimulator.apply_channel` keeps the statevector trajectory behavior for backwards compatibility: it samples one Kraus branch.
 - `DensityMatrixSimulator.apply_channel` applies the full density-matrix channel `rho -> sum_i K_i rho K_i^dagger` and is deterministic except for later measurement sampling.
-- The density-matrix GPU path is not implemented yet. `DensityMatrixSimulator(prefer_gpu=True)` still reports and uses the CPU density backend.
 
 ## Supported QASM Features
 
