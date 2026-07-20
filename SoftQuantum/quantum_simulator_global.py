@@ -51,6 +51,93 @@ Array = np.ndarray
 _EPS = 1e-12
 _BUILTIN_INCLUDES = {"qelib1.inc", "stdgates.inc"}
 _MAX_WHILE_ITERATIONS = 10000
+_DENSITY_CUDA_KERNEL = None
+
+
+_DENSITY_CUDA_SOURCE = r"""
+#include <cuComplex.h>
+
+extern "C" __device__ __forceinline__
+int sq_extract_local(unsigned long long basis, const int* targets, int ntargets) {
+    int local = 0;
+    for (int i = 0; i < ntargets; ++i) {
+        local = (local << 1) | ((basis >> targets[i]) & 1ULL);
+    }
+    return local;
+}
+
+extern "C" __device__ __forceinline__
+unsigned long long sq_replace_targets(unsigned long long basis, int local, const int* targets, int ntargets) {
+    unsigned long long out = basis;
+    for (int i = 0; i < ntargets; ++i) {
+        int bit = (local >> (ntargets - 1 - i)) & 1;
+        unsigned long long mask = 1ULL << targets[i];
+        if (bit) {
+            out |= mask;
+        } else {
+            out &= ~mask;
+        }
+    }
+    return out;
+}
+
+extern "C" __device__ __forceinline__
+bool sq_controls_match(unsigned long long basis, const int* controls, const int* ctrl_state, int ncontrols) {
+    for (int i = 0; i < ncontrols; ++i) {
+        int bit = (basis >> controls[i]) & 1ULL;
+        if (bit != ctrl_state[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+extern "C" __global__
+void sq_density_apply_controlled(
+    const cuDoubleComplex* rho,
+    cuDoubleComplex* out,
+    const cuDoubleComplex* U,
+    const int* targets,
+    int ntargets,
+    const int* controls,
+    const int* ctrl_state,
+    int ncontrols,
+    unsigned long long dim
+) {
+    unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long total = dim * dim;
+    if (tid >= total) {
+        return;
+    }
+
+    unsigned long long row = tid / dim;
+    unsigned long long col = tid - row * dim;
+    int local_dim = 1 << ntargets;
+
+    int row_local_out = sq_extract_local(row, targets, ntargets);
+    int col_local_out = sq_extract_local(col, targets, ntargets);
+    bool row_active = sq_controls_match(row, controls, ctrl_state, ncontrols);
+    bool col_active = sq_controls_match(col, controls, ctrl_state, ncontrols);
+
+    cuDoubleComplex acc = make_cuDoubleComplex(0.0, 0.0);
+    int row_terms = row_active ? local_dim : 1;
+    int col_terms = col_active ? local_dim : 1;
+
+    for (int ai = 0; ai < row_terms; ++ai) {
+        int a = row_active ? ai : row_local_out;
+        unsigned long long in_row = row_active ? sq_replace_targets(row, a, targets, ntargets) : row;
+        cuDoubleComplex coeff_row = row_active ? U[row_local_out * local_dim + a] : make_cuDoubleComplex(1.0, 0.0);
+        for (int bi = 0; bi < col_terms; ++bi) {
+            int b = col_active ? bi : col_local_out;
+            unsigned long long in_col = col_active ? sq_replace_targets(col, b, targets, ntargets) : col;
+            cuDoubleComplex coeff_col = col_active ? cuConj(U[col_local_out * local_dim + b]) : make_cuDoubleComplex(1.0, 0.0);
+            cuDoubleComplex term = cuCmul(cuCmul(coeff_row, rho[in_row * dim + in_col]), coeff_col);
+            acc = cuCadd(acc, term);
+        }
+    }
+    out[tid] = acc;
+}
+"""
 
 
 def _validate_qubits(n_qubits: int, qs: Sequence[int]):
@@ -90,6 +177,15 @@ def _validate_kraus_ops(kraus_ops: Sequence[Array], dim: int, atol: float = 1e-1
         acc += K.conj().T @ K
     if not np.allclose(acc, np.eye(dim, dtype=np.complex128), atol=atol, rtol=0.0):
         raise ValueError("Kraus operators must satisfy sum(K^dagger K) = I")
+
+
+def _get_density_cuda_kernel():
+    global _DENSITY_CUDA_KERNEL
+    if cp is None:
+        raise RuntimeError(_CUDA_STATUS)
+    if _DENSITY_CUDA_KERNEL is None:
+        _DENSITY_CUDA_KERNEL = cp.RawKernel(_DENSITY_CUDA_SOURCE, "sq_density_apply_controlled")
+    return _DENSITY_CUDA_KERNEL
 
 
 def _as_tuple(x: Iterable[int]) -> Tuple[int, ...]:
@@ -1345,35 +1441,40 @@ class DensityMatrixSimulator(QuantumSimulator):
         if num_qubits < 1:
             raise ValueError("num_qubits must be >= 1")
         self._prefer_gpu_requested = bool(prefer_gpu)
-        self.prefer_gpu = False
+        self.prefer_gpu = bool(prefer_gpu) and _HAVE_CUDA
         self._seed = None if seed is None else int(seed)
         self.num_qubits = int(num_qubits)
         self.dim = 1 << self.num_qubits
         self.dtype = np.complex128
         self.rng = np.random.default_rng(self._seed)
-        self.rho: Array = np.zeros((self.dim, self.dim), dtype=self.dtype)
+        if self._gpu_enabled():
+            self.rho = cp.zeros((self.dim, self.dim), dtype=cp.complex128)
+        else:
+            self.rho: Array = np.zeros((self.dim, self.dim), dtype=self.dtype)
         self.rho[0, 0] = 1.0 + 0.0j
         self.creg: List[int] = [0] * self.num_qubits
 
     @property
     def backend_name(self) -> str:
-        return "density_matrix"
+        return "density_matrix_cuda" if self._gpu_enabled() else "density_matrix"
 
     @property
     def backend_status(self) -> str:
+        if self._gpu_enabled():
+            return "Density matrix CUDA backend (CuPy RawKernel)"
         if self._prefer_gpu_requested:
-            return "Density matrix CPU backend (GPU density path is not implemented yet)"
+            return f"Density matrix CPU backend ({_CUDA_STATUS})"
         return "Density matrix CPU backend"
 
     def reset_simulation(self, num_qubits: int, preserve_seed: bool = True):
         seed = self._seed if preserve_seed else None
-        self.__init__(num_qubits, seed=seed, prefer_gpu=False)
+        self.__init__(num_qubits, seed=seed, prefer_gpu=self._prefer_gpu_requested)
 
     def copy_from(self, other: "QuantumSimulator"):
         if not isinstance(other, DensityMatrixSimulator):
             raise TypeError("DensityMatrixSimulator can only copy from another density-matrix simulator")
         self._prefer_gpu_requested = getattr(other, "_prefer_gpu_requested", False)
-        self.prefer_gpu = False
+        self.prefer_gpu = bool(getattr(other, "prefer_gpu", False)) and _HAVE_CUDA
         self._seed = other._seed
         self.num_qubits = other.num_qubits
         self.dim = other.dim
@@ -1383,7 +1484,23 @@ class DensityMatrixSimulator(QuantumSimulator):
         self.creg = list(other.creg)
 
     def _validate_density_matrix(self) -> Array:
-        rho = np.asarray(self.rho)
+        if self._gpu_enabled():
+            if cp is None:
+                raise RuntimeError(_CUDA_STATUS)
+            rho = self.rho if isinstance(self.rho, cp.ndarray) else cp.asarray(self.rho)
+            if rho.shape != (self.dim, self.dim):
+                raise ValueError(f"rho must have shape {(self.dim, self.dim)}, got {rho.shape}")
+            if not np.issubdtype(rho.dtype, np.complexfloating):
+                rho = rho.astype(cp.complex128)
+            elif rho.dtype != cp.complex128:
+                rho = rho.astype(cp.complex128, copy=False)
+            self.rho = rho
+            return self.rho
+
+        if cp is not None and isinstance(self.rho, cp.ndarray):
+            rho = cp.asnumpy(self.rho)
+        else:
+            rho = np.asarray(self.rho)
         if rho.shape != (self.dim, self.dim):
             raise ValueError(f"rho must have shape {(self.dim, self.dim)}, got {rho.shape}")
         if not np.issubdtype(rho.dtype, np.complexfloating):
@@ -1395,8 +1512,10 @@ class DensityMatrixSimulator(QuantumSimulator):
 
     def _cleanup_density_(self, check_trace: bool = True):
         self._validate_density_matrix()
+        xp = cp if self._gpu_enabled() else np
         self.rho = 0.5 * (self.rho + self.rho.conj().T)
-        tr = complex(np.trace(self.rho))
+        tr_raw = xp.trace(self.rho)
+        tr = complex(cp.asnumpy(tr_raw) if self._gpu_enabled() else tr_raw)
         if check_trace:
             if abs(tr) < _EPS:
                 raise ValueError("Density matrix trace is zero")
@@ -1404,21 +1523,29 @@ class DensityMatrixSimulator(QuantumSimulator):
                 raise ValueError(f"Density matrix trace is not preserved: {tr}")
         if abs(tr) > _EPS:
             self.rho /= tr
-        self.rho.real[np.abs(self.rho.real) < _EPS] = 0.0
-        self.rho.imag[np.abs(self.rho.imag) < _EPS] = 0.0
+        if self._gpu_enabled():
+            real = cp.where(cp.abs(cp.real(self.rho)) < _EPS, 0.0, cp.real(self.rho))
+            imag = cp.where(cp.abs(cp.imag(self.rho)) < _EPS, 0.0, cp.imag(self.rho))
+            self.rho = real + 1j * imag
+        else:
+            self.rho.real[np.abs(self.rho.real) < _EPS] = 0.0
+            self.rho.imag[np.abs(self.rho.imag) < _EPS] = 0.0
 
     def density_matrix(self) -> Array:
-        return self._validate_density_matrix().copy()
+        rho = self._validate_density_matrix()
+        return cp.asnumpy(rho).copy() if self._gpu_enabled() else rho.copy()
 
     def purity(self) -> float:
         rho = self._validate_density_matrix()
+        if self._gpu_enabled():
+            return float(cp.asnumpy(cp.real(cp.trace(rho @ rho))))
         return float(np.trace(rho @ rho).real)
 
     def is_pure(self, atol: float = 1e-9) -> bool:
         return abs(self.purity() - 1.0) <= atol
 
     def is_positive_semidefinite(self, atol: float = 1e-9) -> bool:
-        evals = np.linalg.eigvalsh(self._validate_density_matrix())
+        evals = np.linalg.eigvalsh(self.density_matrix())
         return bool(np.min(evals) >= -atol)
 
     def _expanded_operator(self, targets: Sequence[int], U: Array) -> Array:
@@ -1489,12 +1616,82 @@ class DensityMatrixSimulator(QuantumSimulator):
                 full[col, col] = 1.0
         return full
 
+    def _apply_controlled_density_cuda(
+        self,
+        controls: Sequence[int],
+        targets: Sequence[int],
+        U: Array,
+        ctrl_state: Sequence[int],
+    ) -> Array:
+        if cp is None:
+            raise RuntimeError(_CUDA_STATUS)
+        c = _as_tuple(controls)
+        t = _as_tuple(targets)
+        ctrl_state = _as_tuple(ctrl_state)
+        _validate_qubits(self.num_qubits, (*c, *t))
+        _validate_unique_qubits(c, "controls")
+        _validate_unique_qubits(t, "targets")
+        if set(c) & set(t):
+            raise ValueError("controls and targets must be disjoint")
+        if len(ctrl_state) != len(c):
+            raise ValueError("ctrl_state length must match number of controls")
+        if any(b not in (0, 1) for b in ctrl_state):
+            raise ValueError("ctrl_state entries must be 0 or 1")
+        local_dim = 1 << len(t)
+        U = np.asarray(U, dtype=self.dtype)
+        if U.shape != (local_dim, local_dim):
+            raise ValueError(f"Operator must be {(local_dim, local_dim)} for k={len(t)}, got {U.shape}")
+        kernel = _get_density_cuda_kernel()
+        rho_gpu = self._validate_density_matrix()
+        out_gpu = cp.empty_like(rho_gpu)
+        U_gpu = cp.asarray(np.ascontiguousarray(U, dtype=self.dtype).reshape(-1), dtype=cp.complex128)
+        targets_gpu = cp.asarray(np.asarray(t if t else (0,), dtype=np.int32))
+        controls_gpu = cp.asarray(np.asarray(c if c else (0,), dtype=np.int32))
+        ctrl_state_gpu = cp.asarray(np.asarray(ctrl_state if ctrl_state else (0,), dtype=np.int32))
+        total = self.dim * self.dim
+        block = 256
+        grid = ((total + block - 1) // block,)
+        try:
+            kernel(
+                grid,
+                (block,),
+                (
+                    rho_gpu,
+                    out_gpu,
+                    U_gpu,
+                    targets_gpu,
+                    np.int32(len(t)),
+                    controls_gpu,
+                    ctrl_state_gpu,
+                    np.int32(len(c)),
+                    np.uint64(self.dim),
+                ),
+            )
+            return out_gpu
+        except Exception as exc:
+            raise RuntimeError(
+                "Density matrix CUDA kernel failed; check CUDA, NVRTC, TMP, TEMP, and CUPY_CACHE_DIR"
+            ) from exc
+
     def apply_unitary(self, targets: Sequence[int], U: Array, validate_unitary: bool = False):
         self._validate_density_matrix()
-        full = self._expanded_operator(targets, U)
+        t = _as_tuple(targets)
+        k = len(t)
+        if k == 0:
+            return
+        _validate_qubits(self.num_qubits, t)
+        _validate_unique_qubits(t, "targets")
+        m = 1 << k
+        U = np.asarray(U, dtype=self.dtype)
+        if U.shape != (m, m):
+            raise ValueError(f"Operator must be {(m, m)} for k={k}, got {U.shape}")
         if validate_unitary and not _is_unitary(np.asarray(U, dtype=self.dtype)):
             raise ValueError("U must be unitary")
-        self.rho = full @ self.rho @ full.conj().T
+        if self._gpu_enabled():
+            self.rho = self._apply_controlled_density_cuda((), t, U, ())
+        else:
+            full = self._expanded_operator(t, U)
+            self.rho = full @ self.rho @ full.conj().T
         self._cleanup_density_()
 
     def apply_controlled_unitary(
@@ -1510,9 +1707,12 @@ class DensityMatrixSimulator(QuantumSimulator):
         U = np.asarray(U, dtype=self.dtype)
         if validate_unitary and not _is_unitary(U):
             raise ValueError("U must be unitary")
-        full = self._expanded_controlled_operator(controls, targets, U, ctrl_state)
         self._validate_density_matrix()
-        self.rho = full @ self.rho @ full.conj().T
+        if self._gpu_enabled():
+            self.rho = self._apply_controlled_density_cuda(controls, targets, U, ctrl_state)
+        else:
+            full = self._expanded_controlled_operator(controls, targets, U, ctrl_state)
+            self.rho = full @ self.rho @ full.conj().T
         self._cleanup_density_()
 
     def apply_global_unitary_full(self, U_full: Array, validate_unitary: bool = False):
@@ -1522,12 +1722,25 @@ class DensityMatrixSimulator(QuantumSimulator):
             raise ValueError(f"U_full must be {(self.dim, self.dim)}")
         if validate_unitary and not _is_unitary(U_full):
             raise ValueError("U_full must be unitary")
-        self.rho = U_full @ self.rho @ U_full.conj().T
+        if self._gpu_enabled():
+            try:
+                U_gpu = cp.asarray(U_full, dtype=cp.complex128)
+                rho_gpu = self._validate_density_matrix()
+                self.rho = U_gpu @ rho_gpu @ U_gpu.conj().T
+            except Exception as exc:
+                raise RuntimeError(
+                    "Density matrix CUDA full-unitary path failed; check CUDA, TMP, TEMP, and CUPY_CACHE_DIR"
+                ) from exc
+        else:
+            self.rho = U_full @ self.rho @ U_full.conj().T
         self._cleanup_density_()
 
     def _apply_operator(self, targets: Sequence[int], M: Array) -> Array:
-        full = self._expanded_operator(targets, M)
         self._validate_density_matrix()
+        M = np.asarray(M, dtype=self.dtype)
+        if self._gpu_enabled():
+            return self._apply_controlled_density_cuda((), targets, M, ())
+        full = self._expanded_operator(targets, M)
         return full @ self.rho @ full.conj().T
 
     def apply_channel(self, targets: Sequence[int], kraus_ops: Sequence[Array], validate_kraus: bool = True):
@@ -1542,11 +1755,17 @@ class DensityMatrixSimulator(QuantumSimulator):
         if validate_kraus:
             _validate_kraus_ops(ops, dim)
         self._validate_density_matrix()
-        out = np.zeros_like(self.rho)
-        for K in ops:
-            full = self._expanded_operator(t, K)
-            out += full @ self.rho @ full.conj().T
-        self.rho = out
+        if self._gpu_enabled():
+            out = cp.zeros_like(self.rho)
+            for K in ops:
+                out += self._apply_controlled_density_cuda((), t, K, ())
+            self.rho = out
+        else:
+            out = np.zeros_like(self.rho)
+            for K in ops:
+                full = self._expanded_operator(t, K)
+                out += full @ self.rho @ full.conj().T
+            self.rho = out
         self._cleanup_density_(check_trace=validate_kraus)
 
     def measure(self, q: int, cbit: Optional[int] = None) -> int:
@@ -1554,9 +1773,14 @@ class DensityMatrixSimulator(QuantumSimulator):
         _validate_qubits(self.num_qubits, [q])
         cbit_index = None if cbit is None else self._validate_cbit(cbit)
         self._validate_density_matrix()
-        diag = np.real(np.diag(self.rho))
-        mask1 = np.array([bool((idx >> q) & 1) for idx in range(self.dim)])
-        p1 = float(np.sum(diag[mask1]))
+        if self._gpu_enabled():
+            diag = cp.real(cp.diag(self.rho))
+            mask1 = ((cp.arange(self.dim, dtype=cp.uint64) >> q) & 1).astype(cp.bool_)
+            p1 = float(cp.asnumpy(cp.sum(diag[mask1])))
+        else:
+            diag = np.real(np.diag(self.rho))
+            mask1 = np.array([bool((idx >> q) & 1) for idx in range(self.dim)])
+            p1 = float(np.sum(diag[mask1]))
         p1 = min(max(p1, 0.0), 1.0)
         p0 = 1.0 - p1
         outcome = int(self.rng.random() < p1)
@@ -1581,6 +1805,13 @@ class DensityMatrixSimulator(QuantumSimulator):
 
     def probs(self) -> Array:
         self._validate_density_matrix()
+        if self._gpu_enabled():
+            p_gpu = cp.real(cp.diag(self.rho))
+            p_gpu = cp.maximum(p_gpu, 0.0)
+            s = float(cp.asnumpy(cp.sum(p_gpu)))
+            if s > _EPS:
+                p_gpu = p_gpu / s
+            return cp.asnumpy(p_gpu)
         p = np.real(np.diag(self.rho)).copy()
         p[p < 0.0] = 0.0
         s = float(p.sum())
@@ -1590,9 +1821,9 @@ class DensityMatrixSimulator(QuantumSimulator):
         return self.probs()
 
     def state_ket(self, tol: float = 1e-9) -> str:
-        self._validate_density_matrix()
+        rho = self.density_matrix()
         if self.is_pure(atol=max(tol, 1e-9)):
-            evals, evecs = np.linalg.eigh(self.rho)
+            evals, evecs = np.linalg.eigh(rho)
             vec = evecs[:, int(np.argmax(evals))]
             pivot = next((idx for idx, amp in enumerate(vec) if abs(amp) > tol), None)
             if pivot is not None:
@@ -2224,21 +2455,44 @@ def _execute_statements(statements: Sequence[Statement], ctx: ProgramContext):
         raise ValueError(f"Unknown statement kind '{stmt.kind}'")
 
 
-def _extract_shots(statements: Sequence[Statement]) -> Tuple[int, List[Statement]]:
+_PRINT_COMMANDS = {"print_state", "print_probs", "print_creg"}
+
+
+def _extract_shots_and_seed(statements: Sequence[Statement]) -> Tuple[int, Optional[int], List[Statement]]:
     shots = 1
+    seed: Optional[int] = None
     remaining: List[Statement] = []
     for stmt in statements:
         if stmt.kind == "cmd":
             parts = _split_operands(stmt.text)
-            if parts and parts[0].lower() == "shots":
+            cmd = parts[0].lower() if parts else ""
+            if cmd == "shots":
                 if len(parts) != 2:
                     raise ValueError("shots expects exactly one integer expression")
                 shots = _to_int(_eval_expression(parts[1], {"pi": math.pi, "tau": math.tau, "e": math.e}))
                 continue
+            if cmd == "seed":
+                if len(parts) != 2:
+                    raise ValueError("seed expects exactly one integer expression")
+                seed = _to_int(_eval_expression(parts[1], {"pi": math.pi, "tau": math.tau, "e": math.e}))
+                continue
         remaining.append(stmt)
     if shots < 1:
         raise ValueError("shots must be >= 1")
-    return shots, remaining
+    return shots, seed, remaining
+
+
+def _split_top_level_prints(statements: Sequence[Statement]) -> Tuple[List[Statement], List[Statement]]:
+    runtime: List[Statement] = []
+    prints: List[Statement] = []
+    for stmt in statements:
+        if stmt.kind == "cmd":
+            parts = _split_operands(stmt.text)
+            if len(parts) == 1 and parts[0].lower() in _PRINT_COMMANDS:
+                prints.append(stmt)
+                continue
+        runtime.append(stmt)
+    return runtime, prints
 
 
 def _qasm_result_payload(sim: QuantumSimulator, shots: int, counts: Optional[Dict[str, int]]):
@@ -2252,7 +2506,7 @@ def _qasm_result_payload(sim: QuantumSimulator, shots: int, counts: Optional[Dic
     }
     if isinstance(sim, DensityMatrixSimulator):
         payload["state"] = None
-        payload["rho"] = sim.rho.copy()
+        payload["rho"] = sim.density_matrix()
         payload["mode"] = "density_matrix"
     else:
         payload["state"] = sim.state.copy()
@@ -2298,30 +2552,42 @@ def execute_qasm(
     program_text = ";\n".join(lines)
     base = Path(base_path) if base_path is not None else None
     statements = _parse_program(program_text, base)
-    shots, statements = _extract_shots(statements)
+    shots, run_seed, statements = _extract_shots_and_seed(statements)
+    if run_seed is not None:
+        run_sim.reseed(run_seed)
 
     if shots == 1:
-        ctx = ProgramContext(sim=run_sim, base_path=base, qregs={"q": list(range(run_sim.num_qubits))}, cregs={"c": list(range(len(run_sim.creg)))})
+        ctx = ProgramContext(
+            sim=run_sim,
+            base_path=base,
+            qregs={"q": list(range(run_sim.num_qubits))},
+            cregs={"c": list(range(len(run_sim.creg)))},
+        )
         _execute_statements(statements, ctx)
-        print(run_sim.state_ket())
-        for i, bit in enumerate(run_sim.creg):
-            print(f"c[{i}] = {bit}")
         return _qasm_result_payload(run_sim, 1, None)
 
     counts: Counter[str] = Counter()
-    seed_rng = np.random.default_rng(run_sim.seed) if run_sim.seed is not None else None
+    base_seed = run_sim.seed
+    seed_rng = np.random.default_rng(base_seed) if base_seed is not None else None
+    preview_seed = None if base_seed is None else int(np.random.default_rng(base_seed).integers(0, 2**63 - 1))
     last_ctx: Optional[ProgramContext] = None
     initial_qubits = max(run_sim.num_qubits, 1)
     sim_cls = DensityMatrixSimulator if isinstance(run_sim, DensityMatrixSimulator) else QuantumSimulator
+    debug_statements = list(statements)
+    runtime_statements, print_statements = _split_top_level_prints(statements)
 
     for _ in range(shots):
         shot_seed = None if seed_rng is None else int(seed_rng.integers(0, 2**63 - 1))
         if sim_cls is DensityMatrixSimulator:
-            shot_sim = DensityMatrixSimulator(initial_qubits, seed=shot_seed)
+            shot_sim = DensityMatrixSimulator(
+                initial_qubits,
+                seed=shot_seed,
+                prefer_gpu=getattr(run_sim, "_prefer_gpu_requested", False),
+            )
         else:
             shot_sim = QuantumSimulator(initial_qubits, seed=shot_seed, prefer_gpu=run_sim.prefer_gpu)
         ctx = ProgramContext(sim=shot_sim, base_path=base, qregs={"q": list(range(shot_sim.num_qubits))}, cregs={"c": list(range(len(shot_sim.creg)))})
-        _execute_statements(statements, ctx)
+        _execute_statements(runtime_statements, ctx)
         bitstring = _classical_bitstring(ctx) if ctx.saw_measurement else _sample_bitstring_from_state(ctx)
         counts[bitstring] += 1
         last_ctx = ctx
@@ -2332,4 +2598,20 @@ def execute_qasm(
     print(f"shots = {shots}")
     for bitstring in sorted(counts):
         print(f"{bitstring}: {counts[bitstring]}")
+    if print_statements:
+        if sim_cls is DensityMatrixSimulator:
+            preview_sim = DensityMatrixSimulator(
+                initial_qubits,
+                seed=preview_seed,
+                prefer_gpu=getattr(run_sim, "_prefer_gpu_requested", False),
+            )
+        else:
+            preview_sim = QuantumSimulator(initial_qubits, seed=preview_seed, prefer_gpu=run_sim.prefer_gpu)
+        preview_ctx = ProgramContext(
+            sim=preview_sim,
+            base_path=base,
+            qregs={"q": list(range(preview_sim.num_qubits))},
+            cregs={"c": list(range(len(preview_sim.creg)))},
+        )
+        _execute_statements(debug_statements, preview_ctx)
     return _qasm_result_payload(run_sim, shots, dict(counts))

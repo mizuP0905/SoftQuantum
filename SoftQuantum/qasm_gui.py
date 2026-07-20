@@ -121,7 +121,6 @@ QASM_KEYWORDS = [
     "delay",
 ]
 
-
 class QasmStudio(tk.Tk):
     def __init__(self):
         super().__init__()
